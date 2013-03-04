@@ -5,13 +5,22 @@ from threading import local
 
 from django.conf import settings
 from django.template import Node
-from django.utils import simplejson
 from django.utils.encoding import force_unicode, smart_str
-from django.utils.hashcompat import sha_constructor
 
 from debug_toolbar.utils import ms_from_timedelta, tidy_stacktrace, \
                                 get_template_info, get_stack
 from debug_toolbar.utils.compat.db import connections
+
+try:
+    import json
+except ImportError: # python < 2.6
+    from django.utils import simplejson as json
+
+try:
+    from hashlib import sha1
+except ImportError: # python < 2.5
+    from django.utils.hashcompat import sha_constructor as sha1
+
 # TODO:This should be set in the toolbar loader as a default and panels should
 # get a copy of the toolbar object with access to its config dictionary
 SQL_WARNING_THRESHOLD = getattr(settings, 'DEBUG_TOOLBAR_CONFIG', {}) \
@@ -82,12 +91,25 @@ class NormalCursorWrapper(object):
                             for key, value in params.iteritems())
         return map(self._quote_expr, params)
 
+    def _decode(self, param):
+        try:
+            return force_unicode(param, strings_only=True)
+        except UnicodeDecodeError:
+            return '(encoded string)'
+
     def execute(self, sql, params=()):
-        __traceback_hide__ = True
         start = datetime.now()
         try:
             return self.cursor.execute(sql, params)
         finally:
+            # FIXME: Sometimes connections which are not in the connections
+            # dict are used (for example in test database destroying).
+            # The code below (at least get_transaction_id(alias) needs to have
+            # the connection in the connections dict. It would be good to
+            # not have this requirement at all, but for now lets just skip
+            # these connections.
+            if self.db.alias not in connections:
+                return
             stop = datetime.now()
             duration = ms_from_timedelta(stop - start)
             enable_stacktraces = getattr(settings,
@@ -98,10 +120,8 @@ class NormalCursorWrapper(object):
                 stacktrace = []
             _params = ''
             try:
-                _params = simplejson.dumps(
-                        [force_unicode(x, strings_only=True) for x in params]
-                            )
-            except TypeError:
+                _params = json.dumps(map(self._decode, params))
+            except Exception:
                 pass  # object not JSON serializable
 
             template_info = None
@@ -119,7 +139,7 @@ class NormalCursorWrapper(object):
             del cur_frame
 
             alias = getattr(self.db, 'alias', 'default')
-            conn = connections[alias].connection
+            conn = self.db.connection
             # HACK: avoid imports
             if conn:
                 engine = conn.__class__.__module__.split('.', 1)[0]
@@ -134,7 +154,7 @@ class NormalCursorWrapper(object):
                 'duration': duration,
                 'raw_sql': sql,
                 'params': _params,
-                'hash': sha_constructor(settings.SECRET_KEY \
+                'hash': sha1(settings.SECRET_KEY \
                                         + smart_str(sql) \
                                         + _params).hexdigest(),
                 'stacktrace': stacktrace,
@@ -146,10 +166,17 @@ class NormalCursorWrapper(object):
             }
 
             if engine == 'psycopg2':
+                # If an erroneous query was ran on the connection, it might
+                # be in a state where checking isolation_level raises an
+                # exception.
+                try:
+                    iso_level = conn.isolation_level
+                except conn.InternalError:
+                    iso_level = 'unknown'
                 params.update({
                     'trans_id': self.logger.get_transaction_id(alias),
                     'trans_status': conn.get_transaction_status(),
-                    'iso_level': conn.isolation_level,
+                    'iso_level': iso_level,
                     'encoding': conn.encoding,
                 })
 
